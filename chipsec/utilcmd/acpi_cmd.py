@@ -29,7 +29,7 @@ from os.path import exists as path_exists
 from time import time
 from argparse import ArgumentParser
 
-from chipsec.hal.acpi   import ACPI, AcpiRuntimeError, ACPI_TABLES
+from chipsec.hal.acpi   import ACPI, AcpiRuntimeError
 from chipsec.command    import BaseCommand
 
 # ###################################################################
@@ -71,7 +71,7 @@ class ACPICommand(BaseCommand):
     def acpi_table(self):
         name = self._name[0]
         if not self._file and not self._acpi.is_ACPI_table_present( name ):
-            self.logger.error( "Please specify table name from {}".format(ACPI_TABLES.keys()) )
+            self.logger.error( "Please specify table name from {}".format(self._acpi.tableList.keys()) )
             return
         elif self._file and not path_exists( name ):
             self.logger.error( "[CHIPSEC] Unable to find file '{}'".format(name) )

@@ -37,7 +37,6 @@ chipsec@intel.com
 #endif
 
 
-#define _GNU_SOURCE
 #define CHIPSEC_VER_ 		1
 #define CHIPSEC_VER_MINOR	2
 
@@ -56,28 +55,17 @@ MODULE_LICENSE("GPL");
 #include <linux/static_call.h>
 #include <linux/kprobes.h>
 
-static struct kprobe kp = {
-    .symbol_name = "kallsyms_lookup_name",
-    .flags = KPROBE_FLAG_DISABLED
-};
-
-unsigned long kallsyms_lookup_name_c(const char *name)
-{
-	return 0;
-}
-int page_is_ram_c(unsigned long pagenr)
-{
-	return 0;
-}
-
-DEFINE_STATIC_CALL(chipsec_lookup_name_sc, kallsyms_lookup_name_c);
-DEFINE_STATIC_CALL(chipsec_page_is_ram_sc, page_is_ram_c);
+static unsigned long chipsec_lookup_name_scinit(const char *name);
+static int chipsec_page_is_ram_scinit(unsigned long pagenr);
+DEFINE_STATIC_CALL(chipsec_lookup_name_sc, chipsec_lookup_name_scinit);
+DEFINE_STATIC_CALL(chipsec_page_is_ram_sc, chipsec_page_is_ram_scinit);
 #endif
 
-// function page_is_ram is not exported 
+// function page_is_ram is not exported
 // for modules, but is available in kallsyms.
 // So we need determine this address using dirty tricks
-int (*guess_page_is_ram)(unsigned long pagenr);
+static int (*guess_page_is_ram)(unsigned long pagenr);
+static int chipsec_page_is_ram(unsigned long pagenr);
 // same with phys_mem_accesss_prot
 pgprot_t (*guess_phys_mem_access_prot)(struct file *file, unsigned long pfn,
 				       unsigned long size, pgprot_t vma_prot);
@@ -316,19 +304,15 @@ ReadIOPort(
  *         physical address is mapped
  */
 
-void *my_xlate_dev_mem_ptr(unsigned long phys)
+static void *my_xlate_dev_mem_ptr(unsigned long phys)
 {
 
 	void *addr=NULL;
 	unsigned long start = phys & PAGE_MASK;
 	unsigned long pfn = PFN_DOWN(phys);
-	
-        /* If page is RAM, we can use __va. Otherwise ioremap and unmap. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
-	if (static_call(chipsec_page_is_ram_sc)(start >> PAGE_SHIFT)) {
-#else
-	if ((*guess_page_is_ram)(start >> PAGE_SHIFT)) {
-#endif
+
+	/* If page is RAM, we can use __va. Otherwise ioremap and unmap. */
+	if (chipsec_page_is_ram(start >> PAGE_SHIFT)) {
 		if (PageHighMem(pfn_to_page(pfn))) {
                 /* The buffer does not have a mapping.  Map it! */
 		        addr = kmap(pfn_to_page(pfn));	
@@ -339,37 +323,28 @@ void *my_xlate_dev_mem_ptr(unsigned long phys)
 
 	// Not RAM, so it is some device (can be bios for example)
 	addr = (void __force *)IOREMAP_NO_CACHE(start, PAGE_SIZE);
-    
-    if (addr)
-    {
-        addr = (void *)((unsigned long)addr | (phys & ~PAGE_MASK));
-        return addr;
-    }
-    
-    addr = (void __force *)ioremap_prot(start, PAGE_SIZE,0);
-    
+
+	if (!addr)
+		addr = (void __force *)ioremap_prot(start, PAGE_SIZE,0);
+
 	if (addr)
 		addr = (void *)((unsigned long)addr | (phys & ~PAGE_MASK));
+
 	return addr;
 }
 
 // Our own implementation of unxlate_dev_mem_ptr
 // (so we can read highmem and other)
-void my_unxlate_dev_mem_ptr(unsigned long phys,void *addr)
+static void my_unxlate_dev_mem_ptr(unsigned long phys,void *addr)
 {
 	unsigned long pfn = PFN_DOWN(phys); //get page number
 
-	/* If page is RAM, check for highmem, and eventualy do nothing. 
+	/* If page is RAM, check for highmem, and eventualy do nothing.
 	   Otherwise need to iounmap. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
-	if (static_call(chipsec_page_is_ram_sc)((phys >> PAGE_SHIFT))) {
-#else
-	if ((*guess_page_is_ram)(phys >> PAGE_SHIFT)) {
-#endif
-	
-		if (PageHighMem(pfn_to_page(pfn))) { 
-		/* Need to kunmap kmaped memory*/
-		        kunmap(pfn_to_page(pfn));
+	if (chipsec_page_is_ram((phys >> PAGE_SHIFT))) {
+		if (PageHighMem(pfn_to_page(pfn))) {
+			/* Need to kunmap kmaped memory*/
+			kunmap(pfn_to_page(pfn));
 			dbgprint ("unxlate: Highmem detected");
 		}
 		return;
@@ -639,6 +614,15 @@ static pgprot_t cs_phys_mem_access_prot(struct file *file, unsigned long pfn,
 }
 #endif
 
+static phys_addr_t virt_2_phys(void *vaddr)
+{
+#if defined(CONFIG_X86) && LINUX_VERSION_CODE >= KERNEL_VERSION(3,9,0)
+    if (!virt_addr_valid(vaddr))
+	return slow_virt_to_phys(vaddr);
+#endif
+    return virt_to_phys(vaddr);
+}
+
 static const struct vm_operations_struct mmap_mem_ops = {
 #ifdef CONFIG_HAVE_IOREMAP_PROT
 	.access = generic_access_phys
@@ -832,7 +816,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 			return -EFAULT;
 		break;
 #else
-		return -EFAULT;
+		return -EOPNOTSUPP;
 #endif
 	}
 
@@ -862,7 +846,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 			return -EFAULT;
 		break;
 #else
-		return -EFAULT;
+		return -EOPNOTSUPP;
 #endif
 	}
 
@@ -923,7 +907,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 
 		break;
 #else
-		return -EFAULT;
+		return -EOPNOTSUPP;
 #endif
 	}
 
@@ -944,7 +928,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 			return -EFAULT;
 		break;
 #else
-		return -EFAULT;
+		return -EOPNOTSUPP;
 #endif
 	}
 
@@ -963,7 +947,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 			return -EFAULT;
 		break;
 #else
-		return -EFAULT;
+		return -EOPNOTSUPP;
 #endif
 	}
 
@@ -982,7 +966,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 			return -EFAULT;
 		break;
 #else
-		return -EFAULT;
+		return -EOPNOTSUPP;
 #endif
 
 	}
@@ -1008,10 +992,10 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 
 		ptr[4] = val;	
 		if(copy_to_user((void*)ioctl_param, (void*)ptrbuf, (sizeof(long) * numargs)) > 0)
-			return -EFAULT;	
+			return -EFAULT;
 		break;
 #else
-		return -EFAULT;
+		return -EOPNOTSUPP;
 #endif
 	}
 
@@ -1036,7 +1020,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 
 		break;
 #else
-		return -EFAULT;
+		return -EOPNOTSUPP;
 #endif
 	}
     
@@ -1070,9 +1054,11 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 				_store_idtr(&pdtr->limit);
 				break; 
 			}
+			default:
+				return -EINVAL;
               	}
 		
-		dt_pa.quadpart = virt_to_phys((void*)dtr.base);
+		dt_pa.quadpart = virt_2_phys((void*)dtr.base);
 		ptr[0] = dtr.limit;
         #ifdef __x86_64__
 		ptr[1] = (uint32_t)(dtr.base >> 32);
@@ -1090,8 +1076,8 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 			return -EFAULT;
 		break;
 #else
-		return -EFAULT;
-#endif	
+		return -EOPNOTSUPP;
+#endif
 	}
     
     	case IOCTL_SWSMI:
@@ -1110,10 +1096,10 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 		__swsmi__((SMI_CTX *)ptr);
 
 		if(copy_to_user((void*)ioctl_param, (void*)ptrbuf, (sizeof(long) * numargs)) > 0)
-			return -EFAULT;	
+			return -EFAULT;
 		break;
 #else
-		return -EFAULT;
+		return -EOPNOTSUPP;
 #endif
 	}
     
@@ -1151,7 +1137,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 			return -EFAULT;
 		break;
 #else
-		return -EFAULT;
+		return -EOPNOTSUPP;
 #endif
         }
 	case IOCTL_WRCR:
@@ -1188,7 +1174,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 			return -EFAULT;
 		break;
 #else
-        return -EFAULT;
+        return -EOPNOTSUPP;
 #endif
         }
     case IOCTL_ALLOC_PHYSMEM:
@@ -1317,7 +1303,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 		if (data_size < sizeof(uint32_t) * 13)
 		{
 			printk(KERN_ALERT "[chipsec] ERROR: INVALID SIZE PARAMETER\n");
-			return -EFAULT;
+			return -EINVAL;
 		}
         
 		// allocate that much memory
@@ -1325,7 +1311,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 		if (!kbuf)
 		{
 			printk(KERN_ALERT "[chipsec] ERROR: STATUS_UNSUCCESSFUL - could not allocate memory\n" );
-			return -EFAULT;
+			return -ENOMEM;
 		}
 
 		// fill kbuf with user's buffer
@@ -1343,8 +1329,9 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 
                 if (namelen > (data_size - sizeof(uint32_t) * 13))
 		{
+			kfree(kbuf);
 			printk(KERN_ALERT "[chipsec] ERROR: INVALID SIZE PARAMETER (namelen %u too big for data_size %lu)\n", namelen, data_size);
-			return -EFAULT;
+			return -EINVAL;
 		}
         
         // if name overflowed, we only work with the part that fit in kbuf
@@ -1353,7 +1340,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
         {
             kfree(kbuf);
             printk(KERN_ALERT "[chipsec] ERROR: STATUS_UNSUCCESSFUL - could not allocate memory\n" );
-            return -EFAULT;
+            return -ENOMEM;
         }
 
 		for(index=0; index < namelen; index++)
@@ -1430,7 +1417,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
         if (data_size < (sizeof(uint32_t) * 14))
         {
             printk(KERN_ALERT "[chipsec] ERROR: INVALID data_size PARAMETER\n");
-            return -EFAULT;
+            return -EINVAL;
         }
         
         // allocate that much memory
@@ -1438,7 +1425,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
         if (!kbuf)
         {
             printk(KERN_ALERT "[chipsec] ERROR: STATUS_UNSUCCESSFUL - could not allocate memory\n" );
-            return -EFAULT;
+            return -ENOMEM;
         }
 
         // fill kbuf with user's buffer
@@ -1461,7 +1448,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
         { 
             printk(KERN_ALERT "[chipsec] ERROR: INVALID name PARAMETER (namelen = %u)\n", namelen);
             kfree(kbuf);
-            return -EFAULT;
+            return -EINVAL;
         }
         
         // make sure size that was passed in actually fits
@@ -1469,7 +1456,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
         {
             printk(KERN_ALERT "[chipsec] ERROR: INVALID datalen PARAMETER (%u != %lu)\n", datalen, data_size - namelen - sizeof(uint32_t)*14);
             kfree(kbuf);
-            return -EFAULT;
+            return -EINVAL;
         }
         
         // if name overflowed, we only work with the part that fit in kbuf
@@ -1478,7 +1465,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
         {
             printk(KERN_ALERT "[chipsec] ERROR: STATUS_UNSUCCESSFUL - could not allocate memory\n" );
             kfree(kbuf);
-            return -EFAULT;
+            return -ENOMEM;
         }
 
         for(index=0; index < namelen; index++)
@@ -1623,7 +1610,7 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 			return -EFAULT;
 		break;
 #else
-		return -EFAULT;
+		return -EOPNOTSUPP;
 #endif
 	}
 
@@ -1699,16 +1686,16 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
         }
 
         if(copy_to_user((void*)ioctl_param, (void*)ptrbuf, (sizeof(long) * numargs)) > 0)
-          return -EFAULT;	
+          return -EFAULT;
         break;
 #else
-        return -EFAULT;
+        return -EOPNOTSUPP;
 #endif
     }
 
    
 	default:
-		return -EFAULT;
+		return -EINVAL;
 	}
 	return 0;
 }
@@ -1744,7 +1731,7 @@ static struct miscdevice chipsec_dev = {
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,4,0) && LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0)
 
-unsigned long chipsec_lookup_name(const char *name)
+static unsigned long chipsec_lookup_name(const char *name)
 {
 	unsigned int i = 0, first_space_idx = 0, second_space_idx = 0; /* Read Index and indexes of spaces */
 	struct file *proc_ksyms = NULL;
@@ -1816,64 +1803,127 @@ cleanup:
 
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
 
-unsigned long chipsec_lookup_name(const char *name)
+static struct kprobe kp = {
+	.symbol_name = "kallsyms_lookup_name",
+	.flags = KPROBE_FLAG_DISABLED
+};
+
+static unsigned long chipsec_lookup_name_scinit(const char *name)
 {
-	int kp_ret = 0;
-	unsigned long kaddr = 0;
+	unsigned long (*chipsec_lookup_name_fp)(const char *name) = NULL;
+	int kp_ret;
 
-	unsigned long (*chipsec_lookup_name_fp)(const char *name);
-
+	// try kprobes first, but have a fallback as they might be disabled
 	kp_ret = register_kprobe(&kp);
-	if(kp_ret < 0){
-		printk(KERN_ALERT"register_kprobe failed, returned %d\n", kp_ret);
-		return kp_ret;
+	if (kp_ret < 0) {
+		dbgprint("register_kprobe failed, returned %d", kp_ret);
+	} else {
+		chipsec_lookup_name_fp = (unsigned long (*) (const char *name))kp.addr;
+		unregister_kprobe(&kp);
 	}
 
-	chipsec_lookup_name_fp = (unsigned long (*) (const char *name))kp.addr;
-	unregister_kprobe(&kp);
+	// brute force by doing a symbolic search via sprint_symbol
+	if (!chipsec_lookup_name_fp) {
+		char name[KSYM_SYMBOL_LEN];
+		unsigned long start = (unsigned long) sprint_symbol;
+		unsigned long end = start - 32 * 1024;
+		unsigned long addr, offset;
+		char *off_ptr;
 
-	static_call_update(chipsec_lookup_name_sc, chipsec_lookup_name_fp);
-	kaddr = static_call(chipsec_lookup_name_sc)(name);
+		for (addr = start; addr > end; addr--) {
+			if (sprint_symbol(name, addr) <= 0)
+				break;
+			if (!strncmp(name, "0x", 2))
+				break;
+			off_ptr = strchr(name, '+');
+			if (!off_ptr)
+				break;
+			if (sscanf(off_ptr, "+%lx", &offset) != 1)
+				break;
+			addr -= offset;
+			if (off_ptr - name == 20 &&
+			    !strncmp(name, "kallsyms_lookup_name", 20))
+			{
+				chipsec_lookup_name_fp = (void *)addr;
+				break;
+			}
+		}
 
-	return kaddr;
+		if (!chipsec_lookup_name_fp)
+			dbgprint("lookup via sprint_symbol() failed, too");
+	}
+
+	if (chipsec_lookup_name_fp) {
+		static_call_update(chipsec_lookup_name_sc, chipsec_lookup_name_fp);
+		return static_call(chipsec_lookup_name_sc)(name);
+	}
+
+	return 0;
 }
+
+static unsigned long chipsec_lookup_name(const char *name)
+{
+	return static_call(chipsec_lookup_name_sc)(name);
+}
+
 #else
-unsigned long chipsec_lookup_name(const char *name){
+
+static unsigned long chipsec_lookup_name(const char *name){
 	return kallsyms_lookup_name(name);
 }
 
 #endif
 
-int find_symbols(void) 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+
+static int chipsec_page_is_ram_scinit(unsigned long pagenr)
+{
+	BUG_ON(guess_page_is_ram == NULL);	// resolved in find_symbols()
+	static_call_update(chipsec_page_is_ram_sc, guess_page_is_ram);
+	return static_call(chipsec_page_is_ram_sc)(pagenr);
+}
+
+static int chipsec_page_is_ram(unsigned long pagenr)
+{
+	return static_call(chipsec_page_is_ram_sc)(pagenr);
+}
+
+#else
+
+static int chipsec_page_is_ram(unsigned long pagenr)
+{
+	BUG_ON(guess_page_is_ram == NULL);	// resolved in find_symbols()
+	return guess_page_is_ram(pagenr);
+}
+
+#endif
+
+int find_symbols(void)
 {
 	//Older kernels don't have kallsyms_lookup_name. Use FMEM method (pass from run.sh)
-	#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,33)
-		printk("Chipsec warning: Using function addresses provided by run.sh");
-		guess_page_is_ram=(void *)a1;
-		dbgprint ("set guess_page_is_ram: %p\n",guess_page_is_ram);
-		#ifdef __HAVE_PHYS_MEM_ACCESS_PROT
-		guess_phys_mem_access_prot=(void *)a2;
-		dbgprint ("set guess_phys_mem_acess_prot: %p\n",guess_phys_mem_access_prot);
-		#else
-		guess_phys_mem_access_prot = &cs_phys_mem_access_prot;
-		#endif
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,33)
+	printk("Chipsec warning: Using function addresses provided by run.sh");
+	guess_page_is_ram=(void *)a1;
+	dbgprint ("set guess_page_is_ram: %p",guess_page_is_ram);
+	#ifdef __HAVE_PHYS_MEM_ACCESS_PROT
+	guess_phys_mem_access_prot=(void *)a2;
+	dbgprint ("set guess_phys_mem_acess_prot: %p",guess_phys_mem_access_prot);
 	#else
-		guess_page_is_ram = (void *)chipsec_lookup_name("page_is_ram");
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
-		static_call_update(chipsec_page_is_ram_sc, guess_page_is_ram);
-#endif	
-		#ifdef __HAVE_PHYS_MEM_ACCESS_PROT
-		guess_phys_mem_access_prot = (void *)chipsec_lookup_name("phys_mem_access_prot");
-		#else
-		guess_phys_mem_access_prot = &cs_phys_mem_access_prot;
-		#endif
+	guess_phys_mem_access_prot = &cs_phys_mem_access_prot;
+	#endif
+#else
+	guess_page_is_ram = (void *)chipsec_lookup_name("page_is_ram");
+	#ifdef __HAVE_PHYS_MEM_ACCESS_PROT
+	guess_phys_mem_access_prot = (void *)chipsec_lookup_name("phys_mem_access_prot");
+	#else
+	guess_phys_mem_access_prot = &cs_phys_mem_access_prot;
+	#endif
+#endif
+	if (guess_page_is_ram == 0 || guess_phys_mem_access_prot == 0) {
+		printk("Chipsec find_symbols failed. Unloading module");
+		return -1;
+	}
 
-		if(guess_page_is_ram == 0 || guess_phys_mem_access_prot == 0)
-		{
-			printk("Chipsec find_symbols failed. Unloading module");
-			return -1;
-		}
-	#endif 
 	return 0;
 }
 
@@ -1891,7 +1941,7 @@ init_module (void)
 	if (ret)
 	{
 		printk("Chipsec symbol lookup failed\n");
-		return -1;
+		return -EOPNOTSUPP;
 	}
 	ret = misc_register(&chipsec_dev);
 	if (ret)
